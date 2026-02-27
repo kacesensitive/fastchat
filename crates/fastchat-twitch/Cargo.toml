@@ -1,0 +1,15 @@
+[package]
+name = "fastchat-twitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+rand.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+twitch-irc.workspace = true
+fastchat-core = { path = "../fastchat-core" }
