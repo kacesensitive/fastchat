@@ -3,7 +3,10 @@ use std::collections::VecDeque;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{filter::FilterEngine, model::{ChatMessage, FilterDecision}};
+use crate::{
+    filter::FilterEngine,
+    model::{ChatMessage, FilterDecision},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredChatEntry {
@@ -90,6 +93,14 @@ impl ChatStore {
             .collect()
     }
 
+    pub fn visible_entries(&self) -> impl DoubleEndedIterator<Item = &StoredChatEntry> {
+        self.entries.iter().filter(|entry| entry.filter.visible)
+    }
+
+    pub fn visible_len(&self) -> usize {
+        self.visible_count
+    }
+
     pub fn all_entries_cloned(&self) -> Vec<StoredChatEntry> {
         self.entries.iter().cloned().collect()
     }
@@ -123,9 +134,18 @@ mod tests {
     fn ring_buffer_evicts_old_messages() {
         let engine = FilterEngine::new(Default::default());
         let mut store = ChatStore::new(2);
-        store.push(ChatMessage::new_text("c", "a", "A", "1", MessageKind::Chat), &engine);
-        store.push(ChatMessage::new_text("c", "b", "B", "2", MessageKind::Chat), &engine);
-        store.push(ChatMessage::new_text("c", "c", "C", "3", MessageKind::Chat), &engine);
+        store.push(
+            ChatMessage::new_text("c", "a", "A", "1", MessageKind::Chat),
+            &engine,
+        );
+        store.push(
+            ChatMessage::new_text("c", "b", "B", "2", MessageKind::Chat),
+            &engine,
+        );
+        store.push(
+            ChatMessage::new_text("c", "c", "C", "3", MessageKind::Chat),
+            &engine,
+        );
 
         let visible = store.visible_entries_cloned();
         assert_eq!(visible.len(), 2);

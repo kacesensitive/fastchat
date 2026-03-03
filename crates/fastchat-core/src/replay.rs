@@ -1,4 +1,8 @@
-use std::{fs::File, io::{BufRead, BufReader}, path::Path};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -34,7 +38,8 @@ pub struct ReplaySource {
 
 impl ReplaySource {
     pub fn from_jsonl(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("failed opening {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("failed opening {}", path.display()))?;
         let reader = BufReader::new(file);
         let mut records = Vec::new();
         for line in reader.lines() {

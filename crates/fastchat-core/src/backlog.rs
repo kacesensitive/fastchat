@@ -157,9 +157,12 @@ fn write_record(writer: &mut BufWriter<File>, record: &BacklogRecord) -> Result<
 }
 
 pub fn record_path(logs_dir: &Path, channel_login: &str, ts: DateTime<Utc>) -> PathBuf {
-    logs_dir
-        .join(channel_login)
-        .join(format!("{:04}-{:02}-{:02}.jsonl", ts.year(), ts.month(), ts.day()))
+    logs_dir.join(channel_login).join(format!(
+        "{:04}-{:02}-{:02}.jsonl",
+        ts.year(),
+        ts.month(),
+        ts.day()
+    ))
 }
 
 fn prune_logs(logs_dir: &Path, retention: BacklogRetention) -> Result<()> {
@@ -170,7 +173,9 @@ fn prune_logs(logs_dir: &Path, retention: BacklogRetention) -> Result<()> {
         return Ok(());
     }
 
-    for channel_dir in fs::read_dir(logs_dir).with_context(|| format!("read_dir {}", logs_dir.display()))? {
+    for channel_dir in
+        fs::read_dir(logs_dir).with_context(|| format!("read_dir {}", logs_dir.display()))?
+    {
         let channel_dir = channel_dir?;
         if !channel_dir.file_type()?.is_dir() {
             continue;
@@ -181,7 +186,9 @@ fn prune_logs(logs_dir: &Path, retention: BacklogRetention) -> Result<()> {
                 continue;
             }
             let metadata = file.metadata()?;
-            let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let modified = metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             let path = file.path();
 
             let stale_by_age = path

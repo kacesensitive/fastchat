@@ -51,7 +51,10 @@ impl FilterEngine {
             return self.drop_for_visibility(message);
         }
 
-        if self.hidden_users.contains(&message.sender_login.to_lowercase()) {
+        if self
+            .hidden_users
+            .contains(&message.sender_login.to_lowercase())
+        {
             return FilterDecision {
                 visible: false,
                 highlighted: false,
@@ -135,7 +138,8 @@ impl FilterEngine {
             if name.is_empty() {
                 return false;
             }
-            self.hidden_badge_types.contains(name) || self.hidden_badge_types.contains(&name.to_lowercase())
+            self.hidden_badge_types.contains(name)
+                || self.hidden_badge_types.contains(&name.to_lowercase())
         })
     }
 
@@ -248,7 +252,10 @@ mod tests {
         let msg = ChatMessage::new_text("chan", "user", "User", "hello bad", MessageKind::Chat);
         let decision = engine.evaluate(&msg);
         assert!(!decision.visible);
-        assert_eq!(decision.drop_reason, Some(FilterDropReason::ExcludedKeyword));
+        assert_eq!(
+            decision.drop_reason,
+            Some(FilterDropReason::ExcludedKeyword)
+        );
     }
 
     #[test]
@@ -283,7 +290,10 @@ mod tests {
             ChatMessage::new_text("chan", "viewer", "Viewer", "hello", MessageKind::Chat);
         let decision = engine.evaluate(&non_sub_chat);
         assert!(!decision.visible);
-        assert_eq!(decision.drop_reason, Some(FilterDropReason::NonSubscriberHidden));
+        assert_eq!(
+            decision.drop_reason,
+            Some(FilterDropReason::NonSubscriberHidden)
+        );
 
         let system_msg =
             ChatMessage::new_text("chan", "twitch", "Twitch", "notice", MessageKind::Notice);
@@ -307,6 +317,9 @@ mod tests {
 
         let decision = engine.evaluate(&msg);
         assert!(!decision.visible);
-        assert_eq!(decision.drop_reason, Some(FilterDropReason::BadgeTypeHidden));
+        assert_eq!(
+            decision.drop_reason,
+            Some(FilterDropReason::BadgeTypeHidden)
+        );
     }
 }

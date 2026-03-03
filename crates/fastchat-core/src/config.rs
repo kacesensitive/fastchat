@@ -1,4 +1,7 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use directories_next::ProjectDirs;
@@ -31,7 +34,13 @@ impl AppPaths {
         let logs_dir = data_dir.join("logs");
         let assets_cache_dir = cache_dir.join("assets");
 
-        for dir in [&config_dir, &data_dir, &cache_dir, &logs_dir, &assets_cache_dir] {
+        for dir in [
+            &config_dir,
+            &data_dir,
+            &cache_dir,
+            &logs_dir,
+            &assets_cache_dir,
+        ] {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed creating directory {}", dir.display()))?;
         }
@@ -89,7 +98,6 @@ fn save_json_pretty(path: &Path, config: &AppConfig) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(config).context("failed serializing config")?;
     fs::write(&tmp_path, bytes)
         .with_context(|| format!("failed writing {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed replacing {}", path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| format!("failed replacing {}", path.display()))?;
     Ok(())
 }

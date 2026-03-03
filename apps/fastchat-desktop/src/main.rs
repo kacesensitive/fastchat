@@ -1,6 +1,6 @@
 use eframe::egui;
 use fastchat_core::{AppPaths, ConfigRepository, WindowConfig};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> eframe::Result {
     init_tracing();

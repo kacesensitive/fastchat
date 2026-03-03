@@ -73,6 +73,8 @@ pub struct UiConfig {
     pub show_perf_overlay: bool,
     pub filters_panel_open: bool,
     pub enable_message_animations: bool,
+    pub enable_smooth_scroll: bool,
+    pub allow_system_fonts: bool,
     pub show_badges: bool,
     pub chat_background_color: RgbColor,
     pub chat_text_color: RgbColor,
@@ -88,7 +90,9 @@ impl Default for UiConfig {
         Self {
             show_perf_overlay: false,
             filters_panel_open: true,
-            enable_message_animations: true,
+            enable_message_animations: false,
+            enable_smooth_scroll: false,
+            allow_system_fonts: false,
             show_badges: true,
             chat_background_color: RgbColor::from_rgb(0x15, 0x15, 0x18),
             chat_text_color: RgbColor::from_rgb(0xF2, 0xF2, 0xF2),
@@ -265,7 +269,14 @@ impl ChatMessage {
             raw_text,
             kind,
             flags: MessageFlags {
-                is_system_notice: matches!(kind, MessageKind::Notice | MessageKind::UserNotice | MessageKind::ClearChat | MessageKind::ClearMsg | MessageKind::System),
+                is_system_notice: matches!(
+                    kind,
+                    MessageKind::Notice
+                        | MessageKind::UserNotice
+                        | MessageKind::ClearChat
+                        | MessageKind::ClearMsg
+                        | MessageKind::System
+                ),
                 ..Default::default()
             },
         }
@@ -280,17 +291,33 @@ impl ChatMessage {
 pub enum ChatEvent {
     Message(ChatMessage),
     ConnectionState(ConnectionState),
-    Info { channel: Option<String>, text: String },
-    Error { channel: Option<String>, text: String },
+    Info {
+        channel: Option<String>,
+        text: String,
+    },
+    Error {
+        channel: Option<String>,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConnectionState {
     Disconnected,
-    Connecting { channel: String },
-    Connected { channel: String },
-    Reconnecting { channel: String, attempt: u32 },
-    Error { channel: Option<String>, message: String },
+    Connecting {
+        channel: String,
+    },
+    Connected {
+        channel: String,
+    },
+    Reconnecting {
+        channel: String,
+        attempt: u32,
+    },
+    Error {
+        channel: Option<String>,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

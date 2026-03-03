@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use fastchat_core::{ChatMessage, FilterEngine, GlobalFilterConfig, MessageKind};
 
 fn bench_filter_engine(c: &mut Criterion) {
@@ -17,7 +17,11 @@ fn bench_filter_engine(c: &mut Criterion) {
                 "demo",
                 format!("user{i}"),
                 format!("User{i}"),
-                if i % 10 == 0 { "hello rare pog" } else { "hello world" },
+                if i % 10 == 0 {
+                    "hello rare pog"
+                } else {
+                    "hello world"
+                },
                 MessageKind::Chat,
             )
         })

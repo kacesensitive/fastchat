@@ -5,19 +5,27 @@ use fastchat_core::{
     BadgeTag, ChatEvent, ChatMessage, ConnectionState, MessageFlags, MessageFragment, MessageKind,
     RgbColor,
 };
-use tokio::{runtime::Handle, sync::{mpsc, oneshot}, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{debug, info, warn};
 use twitch_irc::{
+    ClientConfig, SecureTCPTransport, TwitchIRCClient,
     login::StaticLoginCredentials,
     message::{
         Badge, ClearChatAction, ClearChatMessage, ClearMsgMessage, NoticeMessage, PrivmsgMessage,
         ServerMessage, UserNoticeMessage,
     },
-    ClientConfig, SecureTCPTransport, TwitchIRCClient,
 };
 
 pub trait TwitchChatClient: Send {
-    fn connect(&mut self, channel: String, events_tx: mpsc::UnboundedSender<ChatEvent>) -> Result<()>;
+    fn connect(
+        &mut self,
+        channel: String,
+        events_tx: mpsc::UnboundedSender<ChatEvent>,
+    ) -> Result<()>;
     fn disconnect(&mut self);
     fn current_channel(&self) -> Option<&str>;
 }
@@ -50,7 +58,11 @@ impl ReconnectPolicy {
         } else {
             (attempt as u64 * 137) % (jitter_ms + 1)
         };
-        Duration::from_millis((base_ms.saturating_mul(exp)).min(max_ms).saturating_add(deterministic_jitter))
+        Duration::from_millis(
+            (base_ms.saturating_mul(exp))
+                .min(max_ms)
+                .saturating_add(deterministic_jitter),
+        )
     }
 }
 
@@ -80,7 +92,11 @@ impl AnonymousTwitchChatClient {
 }
 
 impl TwitchChatClient for AnonymousTwitchChatClient {
-    fn connect(&mut self, channel: String, events_tx: mpsc::UnboundedSender<ChatEvent>) -> Result<()> {
+    fn connect(
+        &mut self,
+        channel: String,
+        events_tx: mpsc::UnboundedSender<ChatEvent>,
+    ) -> Result<()> {
         self.disconnect();
 
         let normalized_channel = normalize_channel_login(&channel)?;
@@ -203,7 +219,10 @@ fn normalize_channel_login(input: &str) -> Result<String> {
     if trimmed.is_empty() {
         anyhow::bail!("channel username is required");
     }
-    if !trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         anyhow::bail!("channel username contains invalid characters");
     }
     Ok(trimmed)
@@ -216,7 +235,9 @@ impl TwitchNormalizer {
     pub fn normalize(&self, message: ServerMessage) -> Option<ChatEvent> {
         match message {
             ServerMessage::Privmsg(msg) => Some(ChatEvent::Message(self.privmsg_to_chat(msg))),
-            ServerMessage::UserNotice(msg) => Some(ChatEvent::Message(self.usernotice_to_chat(msg))),
+            ServerMessage::UserNotice(msg) => {
+                Some(ChatEvent::Message(self.usernotice_to_chat(msg)))
+            }
             ServerMessage::Notice(msg) => Some(ChatEvent::Message(self.notice_to_chat(msg))),
             ServerMessage::ClearChat(msg) => Some(ChatEvent::Message(self.clearchat_to_chat(msg))),
             ServerMessage::ClearMsg(msg) => Some(ChatEvent::Message(self.clearmsg_to_chat(msg))),
@@ -240,11 +261,19 @@ impl TwitchNormalizer {
             channel_id: Some(msg.channel_id),
             sender_login: msg.sender.login,
             display_name: msg.sender.name,
-            name_color: msg.name_color.map(|c| RgbColor { r: c.r, g: c.g, b: c.b }),
+            name_color: msg.name_color.map(|c| RgbColor {
+                r: c.r,
+                g: c.g,
+                b: c.b,
+            }),
             badges: badges_to_tags(&msg.badges),
             fragments: build_fragments(&msg.message_text, &msg.emotes),
             raw_text: msg.message_text,
-            kind: if msg.is_action { MessageKind::Action } else { MessageKind::Chat },
+            kind: if msg.is_action {
+                MessageKind::Action
+            } else {
+                MessageKind::Chat
+            },
             flags,
         }
     }
@@ -278,7 +307,11 @@ impl TwitchNormalizer {
             channel_id: Some(msg.channel_id),
             sender_login: msg.sender.login,
             display_name: msg.sender.name,
-            name_color: msg.name_color.map(|c| RgbColor { r: c.r, g: c.g, b: c.b }),
+            name_color: msg.name_color.map(|c| RgbColor {
+                r: c.r,
+                g: c.g,
+                b: c.b,
+            }),
             badges: badges_to_tags(&msg.badges),
             fragments: vec![MessageFragment::Text(raw_text.clone())],
             raw_text,
@@ -289,7 +322,13 @@ impl TwitchNormalizer {
 
     fn notice_to_chat(&self, msg: NoticeMessage) -> ChatMessage {
         let channel_login = msg.channel_login.unwrap_or_else(|| "twitch".to_owned());
-        let mut message = ChatMessage::new_text(channel_login, "twitch", "Twitch", msg.message_text, MessageKind::Notice);
+        let mut message = ChatMessage::new_text(
+            channel_login,
+            "twitch",
+            "Twitch",
+            msg.message_text,
+            MessageKind::Notice,
+        );
         message.flags.is_system_notice = true;
         message
     }
@@ -298,11 +337,21 @@ impl TwitchNormalizer {
         let text = match msg.action {
             ClearChatAction::ChatCleared => "Chat was cleared".to_owned(),
             ClearChatAction::UserBanned { user_login, .. } => format!("{user_login} was banned"),
-            ClearChatAction::UserTimedOut { user_login, timeout_length, .. } => {
+            ClearChatAction::UserTimedOut {
+                user_login,
+                timeout_length,
+                ..
+            } => {
                 format!("{user_login} timed out for {}s", timeout_length.as_secs())
             }
         };
-        let mut message = ChatMessage::new_text(msg.channel_login, "twitch", "Twitch", text, MessageKind::ClearChat);
+        let mut message = ChatMessage::new_text(
+            msg.channel_login,
+            "twitch",
+            "Twitch",
+            text,
+            MessageKind::ClearChat,
+        );
         message.channel_id = Some(msg.channel_id);
         message.timestamp = msg.server_timestamp;
         message.flags.is_system_notice = true;
@@ -310,8 +359,17 @@ impl TwitchNormalizer {
     }
 
     fn clearmsg_to_chat(&self, msg: ClearMsgMessage) -> ChatMessage {
-        let text = format!("Deleted message from {}: {}", msg.sender_login, msg.message_text);
-        let mut message = ChatMessage::new_text(msg.channel_login, "twitch", "Twitch", text, MessageKind::ClearMsg);
+        let text = format!(
+            "Deleted message from {}: {}",
+            msg.sender_login, msg.message_text
+        );
+        let mut message = ChatMessage::new_text(
+            msg.channel_login,
+            "twitch",
+            "Twitch",
+            text,
+            MessageKind::ClearMsg,
+        );
         message.timestamp = msg.server_timestamp;
         message.flags.is_system_notice = true;
         message
@@ -342,10 +400,7 @@ fn flags_from_badges(badges: &[Badge]) -> MessageFlags {
     flags
 }
 
-fn build_fragments(
-    raw_text: &str,
-    emotes: &[twitch_irc::message::Emote],
-) -> Vec<MessageFragment> {
+fn build_fragments(raw_text: &str, emotes: &[twitch_irc::message::Emote]) -> Vec<MessageFragment> {
     if emotes.is_empty() {
         return vec![MessageFragment::Text(raw_text.to_owned())];
     }
@@ -439,12 +494,15 @@ fn text_pill_badge(badge: &BadgeTag) -> BadgePresentation {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_channel_login, TwitchCdnAssetResolver, TwitchNormalizer};
+    use super::{TwitchCdnAssetResolver, TwitchNormalizer, normalize_channel_login};
     use crate::AssetResolver;
 
     #[test]
     fn normalizes_channel_name() {
-        assert_eq!(normalize_channel_login("#SodaPoppin").unwrap(), "sodapoppin");
+        assert_eq!(
+            normalize_channel_login("#SodaPoppin").unwrap(),
+            "sodapoppin"
+        );
         assert!(normalize_channel_login("bad-name!").is_err());
     }
 

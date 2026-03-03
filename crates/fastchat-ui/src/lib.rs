@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use eframe::egui::{self, Align, Color32, RichText};
 use fastchat_core::{
     AppConfig, AppPaths, BacklogRecord, BacklogRetention, BacklogWriter, ChatEvent, ChatFontFamily,
@@ -20,9 +19,12 @@ use fastchat_twitch::{
 };
 use lru::LruCache;
 use parking_lot::Mutex;
-use serde::Deserialize;
 use reqwest::StatusCode;
-use tokio::{runtime::{Handle, Runtime}, sync::mpsc};
+use serde::Deserialize;
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::mpsc,
+};
 use tracing::{error, warn};
 
 pub struct FastChatApp {
@@ -40,6 +42,7 @@ pub struct FastChatApp {
     backlog_writer: BacklogWriter,
     asset_cache: AssetCacheHandle,
     row_layout_cache: RowLayoutCache,
+    popout_row_layout_cache: RowLayoutCache,
     perf_overlay: PerfOverlayState,
     connection_state: ConnectionState,
     ui_snapshot: UiSnapshot,
@@ -49,6 +52,7 @@ pub struct FastChatApp {
     status_message: Option<String>,
     visible_stick_to_bottom: bool,
     jump_to_latest_requested: bool,
+    focused_sender_login: Option<String>,
     chat_scroll: ChatScrollState,
     popout_window_open: bool,
     popout_selected_message_id: Option<String>,
@@ -132,7 +136,9 @@ impl ChatTypography {
     }
 
     fn row_height(self) -> f32 {
-        (self.emote_height().max(self.size * 1.18) + 4.0).ceil().max(20.0)
+        (self.emote_height().max(self.size * 1.18) + 4.0)
+            .ceil()
+            .max(20.0)
     }
 
     fn badge_text_size(self) -> f32 {
@@ -165,37 +171,6 @@ impl ChatAppearance {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ChatRowAnimation {
-    opacity: f32,
-    x_offset: f32,
-}
-
-impl ChatRowAnimation {
-    fn for_message(entry: &StoredChatEntry, ui_config: &UiConfig, now: chrono::DateTime<Utc>) -> Option<Self> {
-        if !ui_config.enable_message_animations {
-            return None;
-        }
-
-        const ANIM_MS: i64 = 140;
-        let age_ms = now
-            .signed_duration_since(entry.inserted_at)
-            .num_milliseconds()
-            .max(0);
-        if age_ms >= ANIM_MS {
-            return None;
-        }
-
-        let t = (age_ms as f32 / ANIM_MS as f32).clamp(0.0, 1.0);
-        // Fast ease-out for a snappy entrance.
-        let eased = 1.0_f32 - (1.0_f32 - t).powi(3);
-        Some(Self {
-            opacity: (0.22_f32 + 0.78_f32 * eased).clamp(0.0_f32, 1.0_f32),
-            x_offset: (1.0_f32 - eased) * 12.0_f32,
-        })
-    }
-}
-
 #[derive(Clone, Copy)]
 enum FontFallbackBase {
     Proportional,
@@ -214,21 +189,46 @@ struct SystemFontCandidate {
 #[derive(Debug)]
 pub struct RowLayoutCache {
     row_height_cache: LruCache<u64, f32>,
+    average_row_height: f32,
 }
 
 impl RowLayoutCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             row_height_cache: LruCache::new(std::num::NonZeroUsize::new(capacity.max(16)).unwrap()),
+            average_row_height: 0.0,
         }
     }
 
     pub fn clear(&mut self) {
         self.row_height_cache.clear();
+        self.average_row_height = 0.0;
     }
 
     pub fn note_row(&mut self, key: u64, height: f32) {
         self.row_height_cache.put(key, height);
+        let clamped_height = height.max(1.0);
+        if self.average_row_height <= 0.0 {
+            self.average_row_height = clamped_height;
+        } else {
+            // Lightweight EMA keeps virtualization stable without rescanning the full buffer.
+            self.average_row_height = self.average_row_height * 0.92 + clamped_height * 0.08;
+        }
+    }
+
+    pub fn estimated_row_height(&self, key: u64, fallback: f32) -> f32 {
+        self.row_height_cache
+            .peek(&key)
+            .copied()
+            .unwrap_or(fallback)
+    }
+
+    pub fn average_row_height(&self, fallback: f32) -> f32 {
+        if self.average_row_height > 0.0 {
+            self.average_row_height
+        } else {
+            fallback
+        }
     }
 }
 
@@ -247,6 +247,11 @@ struct AssetCacheInner {
     failed_urls: HashSet<String>,
     fetch_results_tx: crossbeam_channel::Sender<AssetPipelineResult>,
     fetch_results_rx: crossbeam_channel::Receiver<AssetPipelineResult>,
+    channel_icon_urls: HashMap<String, String>,
+    pending_channel_icons: HashSet<String>,
+    failed_channel_icons: HashSet<String>,
+    channel_icon_results_tx: crossbeam_channel::Sender<ChannelIconResult>,
+    channel_icon_results_rx: crossbeam_channel::Receiver<ChannelIconResult>,
     badge_global_index: Option<BadgeIconIndex>,
     badge_channel_indexes: HashMap<String, BadgeIconIndex>,
     pending_badge_global: bool,
@@ -277,6 +282,11 @@ struct AssetPipelineResult {
 struct DecodedRgbaImage {
     size: [usize; 2],
     rgba: Vec<u8>,
+}
+
+struct ChannelIconResult {
+    channel_login: String,
+    icon_url: Result<Option<String>, String>,
 }
 
 type BadgeIconIndex = HashMap<(String, String), String>;
@@ -325,6 +335,11 @@ struct IvrBadgeVersion {
     image_url_4x: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct IvrUser {
+    logo: Option<String>,
+}
+
 impl AssetCacheHandle {
     pub fn new(runtime: Handle) -> Self {
         let http_client = reqwest::Client::builder()
@@ -333,6 +348,7 @@ impl AssetCacheHandle {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let (fetch_results_tx, fetch_results_rx) = crossbeam_channel::unbounded();
+        let (channel_icon_results_tx, channel_icon_results_rx) = crossbeam_channel::unbounded();
         let (badge_meta_results_tx, badge_meta_results_rx) = crossbeam_channel::unbounded();
 
         Self {
@@ -346,6 +362,11 @@ impl AssetCacheHandle {
                 failed_urls: HashSet::new(),
                 fetch_results_tx,
                 fetch_results_rx,
+                channel_icon_urls: HashMap::new(),
+                pending_channel_icons: HashSet::new(),
+                failed_channel_icons: HashSet::new(),
+                channel_icon_results_tx,
+                channel_icon_results_rx,
                 badge_global_index: None,
                 badge_channel_indexes: HashMap::new(),
                 pending_badge_global: false,
@@ -397,20 +418,52 @@ impl AssetCacheHandle {
             .collect()
     }
 
+    pub fn render_channel_icon(
+        &self,
+        ui: &mut egui::Ui,
+        channel_login: &str,
+        target_height: f32,
+    ) -> bool {
+        match self.lookup_or_request_channel_icon(channel_login) {
+            Some(url) => self.render_image_from_url(ui, &url, target_height, Some(channel_login)),
+            None => false,
+        }
+    }
+
     pub fn pump_completed(&self, ctx: &egui::Context) {
+        const MAX_BADGE_META_PER_FRAME: usize = 12;
+        const MAX_CHANNEL_ICON_META_PER_FRAME: usize = 8;
+        const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 20;
+
         let mut pending_badge_meta_results = Vec::new();
+        let mut pending_channel_icon_results = Vec::new();
         let mut pending_results = Vec::new();
         {
             let inner = self.inner.lock();
-            while let Ok(result) = inner.badge_meta_results_rx.try_recv() {
+            while pending_badge_meta_results.len() < MAX_BADGE_META_PER_FRAME {
+                let Ok(result) = inner.badge_meta_results_rx.try_recv() else {
+                    break;
+                };
                 pending_badge_meta_results.push(result);
             }
-            while let Ok(result) = inner.fetch_results_rx.try_recv() {
+            while pending_channel_icon_results.len() < MAX_CHANNEL_ICON_META_PER_FRAME {
+                let Ok(result) = inner.channel_icon_results_rx.try_recv() else {
+                    break;
+                };
+                pending_channel_icon_results.push(result);
+            }
+            while pending_results.len() < MAX_IMAGE_UPLOADS_PER_FRAME {
+                let Ok(result) = inner.fetch_results_rx.try_recv() else {
+                    break;
+                };
                 pending_results.push(result);
             }
         }
 
-        if pending_badge_meta_results.is_empty() && pending_results.is_empty() {
+        if pending_badge_meta_results.is_empty()
+            && pending_channel_icon_results.is_empty()
+            && pending_results.is_empty()
+        {
             return;
         }
 
@@ -434,7 +487,9 @@ impl AssetCacheHandle {
                     inner.pending_badge_channels.remove(&channel_id);
                     match result.decoded {
                         Ok(index) => {
-                            inner.badge_channel_indexes.insert(channel_id.clone(), index);
+                            inner
+                                .badge_channel_indexes
+                                .insert(channel_id.clone(), index);
                             inner.failed_badge_channels.remove(&channel_id);
                         }
                         Err(err) => {
@@ -442,6 +497,30 @@ impl AssetCacheHandle {
                             warn!(channel_id = %channel_id, error = %err, "channel badge metadata fetch failed");
                         }
                     }
+                }
+            }
+        }
+        for result in pending_channel_icon_results {
+            inner.pending_channel_icons.remove(&result.channel_login);
+            match result.icon_url {
+                Ok(Some(url)) => {
+                    inner
+                        .channel_icon_urls
+                        .insert(result.channel_login.clone(), url);
+                    inner.failed_channel_icons.remove(&result.channel_login);
+                }
+                Ok(None) => {
+                    inner.failed_channel_icons.insert(result.channel_login);
+                }
+                Err(err) => {
+                    inner
+                        .failed_channel_icons
+                        .insert(result.channel_login.clone());
+                    warn!(
+                        channel = %result.channel_login,
+                        error = %err,
+                        "channel icon metadata fetch failed"
+                    );
                 }
             }
         }
@@ -628,6 +707,42 @@ impl AssetCacheHandle {
 
         lookup
     }
+
+    fn lookup_or_request_channel_icon(&self, channel_login: &str) -> Option<String> {
+        let normalized = normalize_channel_login_for_display(channel_login)?;
+        let spawn_task = {
+            let mut inner = self.inner.lock();
+            if let Some(url) = inner.channel_icon_urls.get(&normalized) {
+                return Some(url.clone());
+            }
+            if inner.pending_channel_icons.contains(&normalized)
+                || inner.failed_channel_icons.contains(&normalized)
+            {
+                return None;
+            }
+            inner.pending_channel_icons.insert(normalized.clone());
+            Some((
+                inner.runtime.clone(),
+                inner.http_client.clone(),
+                inner.channel_icon_results_tx.clone(),
+                normalized,
+            ))
+        };
+
+        if let Some((runtime, http_client, results_tx, channel_login)) = spawn_task {
+            runtime.spawn(async move {
+                let icon_url = fetch_channel_icon_url(&http_client, &channel_login)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                let _ = results_tx.send(ChannelIconResult {
+                    channel_login,
+                    icon_url,
+                });
+            });
+        }
+
+        None
+    }
 }
 
 async fn fetch_and_decode_image(client: &reqwest::Client, url: &str) -> Result<DecodedRgbaImage> {
@@ -657,6 +772,39 @@ async fn fetch_and_decode_image(client: &reqwest::Client, url: &str) -> Result<D
         size: [width as usize, height as usize],
         rgba: decoded.into_raw(),
     })
+}
+
+async fn fetch_channel_icon_url(
+    client: &reqwest::Client,
+    channel_login: &str,
+) -> Result<Option<String>> {
+    let channel_login = normalize_channel_login_for_display(channel_login)
+        .ok_or_else(|| anyhow::anyhow!("channel login is empty"))?;
+    let url = format!("https://api.ivr.fi/v2/twitch/user?login={channel_login}");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("request failed for {url}"))?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status != StatusCode::OK {
+        anyhow::bail!("http {status} for {url}");
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed reading body for {url}"))?;
+    let users: Vec<IvrUser> =
+        serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON from {url}"))?;
+
+    Ok(users
+        .into_iter()
+        .filter_map(|user| user.logo)
+        .find(|logo| !logo.trim().is_empty()))
 }
 
 fn paint_texture_scaled(
@@ -873,7 +1021,11 @@ impl FastChatApp {
             eprintln!("failed to load config, using defaults: {err:#}");
             AppConfig::default()
         });
-        let available_chat_fonts = install_chat_fonts(&_cc.egui_ctx);
+        let normalized_animation_config_changed =
+            config.ui.enable_message_animations || config.ui.enable_smooth_scroll;
+        config.ui.enable_message_animations = false;
+        config.ui.enable_smooth_scroll = false;
+        let available_chat_fonts = install_chat_fonts(&_cc.egui_ctx, config.ui.allow_system_fonts);
         if !available_chat_fonts.contains(&config.ui.chat_font_family) {
             config.ui.chat_font_family = ChatFontFamily::Proportional;
         }
@@ -882,12 +1034,13 @@ impl FastChatApp {
         let twitch_client = AnonymousTwitchChatClient::new(runtime.handle().clone());
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let filter_engine = FilterEngine::new(config.global_filters.clone());
-        let chat_store = ChatStore::new(75_000);
+        let chat_store = ChatStore::new(15_000);
         let backlog_writer = BacklogWriter::spawn(&paths, BacklogRetention::default());
         let asset_cache = AssetCacheHandle::new(runtime.handle().clone());
         let channel_input = config.last_channel.clone().unwrap_or_default();
         let filter_fields = FilterTextFields::from_config(&config.global_filters);
-        let first_frame_auto_connect = config.auto_reconnect_last_channel && !channel_input.is_empty();
+        let first_frame_auto_connect =
+            config.auto_reconnect_last_channel && !channel_input.is_empty();
 
         Ok(Self {
             runtime,
@@ -904,15 +1057,18 @@ impl FastChatApp {
             backlog_writer,
             asset_cache,
             row_layout_cache: RowLayoutCache::new(4096),
+            popout_row_layout_cache: RowLayoutCache::new(4096),
             perf_overlay: PerfOverlayState::new(),
             connection_state: ConnectionState::Disconnected,
             ui_snapshot: UiSnapshot::default(),
             first_frame_auto_connect,
-            pending_config_save_since: None,
+            pending_config_save_since: normalized_animation_config_changed
+                .then_some(Instant::now()),
             last_config_save_error: None,
             status_message: None,
             visible_stick_to_bottom: true,
             jump_to_latest_requested: false,
+            focused_sender_login: None,
             chat_scroll: ChatScrollState::default(),
             popout_window_open: false,
             popout_selected_message_id: None,
@@ -926,6 +1082,7 @@ impl FastChatApp {
     }
 
     fn poll_events(&mut self) {
+        const EVENT_POLL_BUDGET_PER_FRAME: u32 = 1200;
         let mut processed_this_frame = 0u32;
         loop {
             match self.events_rx.try_recv() {
@@ -933,7 +1090,7 @@ impl FastChatApp {
                     processed_this_frame += 1;
                     self.events_processed_total = self.events_processed_total.saturating_add(1);
                     self.handle_event(event);
-                    if processed_this_frame >= 10_000 {
+                    if processed_this_frame >= EVENT_POLL_BUDGET_PER_FRAME {
                         warn!("event poll budget hit in one frame");
                         break;
                     }
@@ -954,14 +1111,17 @@ impl FastChatApp {
         match event {
             ChatEvent::Message(message) => {
                 self.observe_badge_types(&message);
-                self.backlog_writer.append(BacklogRecord::from_message(message.clone()));
+                self.backlog_writer
+                    .append(BacklogRecord::from_message(message.clone()));
                 self.chat_store.push(message, &self.filter_engine);
             }
             ChatEvent::ConnectionState(state) => {
                 self.connection_state = state.clone();
                 self.status_message = Some(match &state {
                     ConnectionState::Disconnected => "Disconnected".to_owned(),
-                    ConnectionState::Connecting { channel } => format!("Connecting to #{channel}..."),
+                    ConnectionState::Connecting { channel } => {
+                        format!("Connecting to #{channel}...")
+                    }
                     ConnectionState::Connected { channel } => format!("Connected to #{channel}"),
                     ConnectionState::Reconnecting { channel, attempt } => {
                         format!("Reconnecting to #{channel} (attempt {attempt})")
@@ -994,7 +1154,10 @@ impl FastChatApp {
             return;
         }
 
-        match self.twitch_client.connect(requested.clone(), self.events_tx.clone()) {
+        match self
+            .twitch_client
+            .connect(requested.clone(), self.events_tx.clone())
+        {
             Ok(()) => {
                 self.config.last_channel = Some(requested);
                 self.mark_config_dirty();
@@ -1032,12 +1195,23 @@ impl FastChatApp {
     fn apply_filter_fields_to_config(&mut self) {
         self.config.global_filters.include_terms = parse_terms(&self.filter_fields.include_terms);
         self.config.global_filters.exclude_terms = parse_terms(&self.filter_fields.exclude_terms);
-        self.config.global_filters.highlight_terms = parse_terms(&self.filter_fields.highlight_terms);
+        self.config.global_filters.highlight_terms =
+            parse_terms(&self.filter_fields.highlight_terms);
         self.config.global_filters.hidden_users = parse_terms(&self.filter_fields.hidden_users);
-        self.filter_engine.set_config(self.config.global_filters.clone());
+        self.filter_engine
+            .set_config(self.config.global_filters.clone());
         self.chat_store.recompute_filters(&self.filter_engine);
         self.row_layout_cache.clear();
         self.mark_config_dirty();
+    }
+
+    fn toggle_focused_sender_login(&mut self, sender_login: String) {
+        if self.focused_sender_login.as_deref() == Some(sender_login.as_str()) {
+            self.focused_sender_login = None;
+        } else {
+            self.focused_sender_login = Some(sender_login);
+        }
+        self.popout_selected_message_id = None;
     }
 
     fn observe_badge_types(&mut self, message: &ChatMessage) {
@@ -1136,7 +1310,27 @@ impl FastChatApp {
                 }
             });
 
-            let button_label = if matches!(self.connection_state, ConnectionState::Connected { .. }) {
+            if let Some(channel_login) =
+                channel_login_for_icon(&self.connection_state, &self.channel_input)
+            {
+                ui.horizontal(|ui| {
+                    let icon_size = 22.0_f32;
+                    if !self
+                        .asset_cache
+                        .render_channel_icon(ui, &channel_login, icon_size)
+                    {
+                        render_channel_icon_placeholder(ui, icon_size);
+                    }
+                    ui.label(
+                        RichText::new(format!("#{channel_login}"))
+                            .small()
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                });
+            }
+
+            let button_label = if matches!(self.connection_state, ConnectionState::Connected { .. })
+            {
                 "Reconnect"
             } else {
                 "Connect"
@@ -1148,6 +1342,21 @@ impl FastChatApp {
 
         ui.collapsing("Typography", |ui| {
             let mut typography_changed = false;
+            let system_fonts_changed = ui
+                .checkbox(&mut self.config.ui.allow_system_fonts, "Use system fonts")
+                .on_hover_text("When off, Fast Chat only uses built-in fonts.")
+                .changed();
+            if system_fonts_changed {
+                self.available_chat_fonts =
+                    install_chat_fonts(ctx, self.config.ui.allow_system_fonts);
+                if !self
+                    .available_chat_fonts
+                    .contains(&self.config.ui.chat_font_family)
+                {
+                    self.config.ui.chat_font_family = ChatFontFamily::Proportional;
+                }
+                typography_changed = true;
+            }
             ui.horizontal(|ui| {
                 ui.label("Font");
                 egui::ComboBox::from_id_salt("chat_font_family_selector")
@@ -1178,6 +1387,7 @@ impl FastChatApp {
 
             if typography_changed {
                 self.row_layout_cache.clear();
+                self.popout_row_layout_cache.clear();
                 self.mark_config_dirty();
             }
         });
@@ -1204,7 +1414,7 @@ impl FastChatApp {
                 })
                 .inner;
             if popout_size_changed {
-                self.row_layout_cache.clear();
+                self.popout_row_layout_cache.clear();
                 self.mark_config_dirty();
             }
 
@@ -1253,13 +1463,6 @@ impl FastChatApp {
             if perf_changed {
                 self.mark_config_dirty();
             }
-
-            let anim_changed = ui
-                .checkbox(&mut self.config.ui.enable_message_animations, "Animate new messages")
-                .changed();
-            if anim_changed {
-                self.mark_config_dirty();
-            }
         });
     }
 
@@ -1271,265 +1474,404 @@ impl FastChatApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                self.render_sidebar_tools(ui, ctx);
-                ui.separator();
-                ui.heading("Filters");
-                ui.add_space(6.0);
+                        self.render_sidebar_tools(ui, ctx);
+                        ui.separator();
+                        ui.heading("Filters");
+                        ui.add_space(6.0);
 
-                ui.horizontal(|ui| {
-                    ui.label("Include");
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.filter_fields.include_terms).hint_text("comma-separated"))
-                        .changed()
-                    {
-                        self.apply_filter_fields_to_config();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Exclude");
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.filter_fields.exclude_terms).hint_text("comma-separated"))
-                        .changed()
-                    {
-                        self.apply_filter_fields_to_config();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Highlight");
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.filter_fields.highlight_terms).hint_text("comma-separated"))
-                        .changed()
-                    {
-                        self.apply_filter_fields_to_config();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Hidden users");
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut self.filter_fields.hidden_users).hint_text("comma-separated"))
-                        .changed()
-                    {
-                        self.apply_filter_fields_to_config();
-                    }
-                });
-
-                ui.separator();
-
-                let mut filter_logic_changed = false;
-                let mut appearance_changed = false;
-                filter_logic_changed |= ui.horizontal(|ui| {
-                    ui.label("Min length");
-                    ui.add(egui::DragValue::new(&mut self.config.global_filters.min_message_len).range(0..=500))
-                        .changed()
-                }).inner;
-
-                ui.collapsing("Message visibility", |ui| {
-                    let v = &mut self.config.global_filters.visibility;
-                    filter_logic_changed |= ui.checkbox(&mut v.show_mod_messages, "Show mods").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_vip_messages, "Show VIPs").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_subscriber_messages, "Show subscribers").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_non_subscriber_messages, "Show non-subscribers").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_cheers, "Show cheers/bits").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_redeems, "Show redeems/highlights").changed();
-                    filter_logic_changed |= ui.checkbox(&mut v.show_system_notices, "Show system notices").changed();
-                });
-
-                let badge_type_filters = self.badge_type_filter_options();
-                ui.collapsing("Badge types", |ui| {
-                    if badge_type_filters.is_empty() {
-                        ui.label(RichText::new("No badge types seen yet.").color(Color32::GRAY));
-                        return;
-                    }
-
-                    ui.label(
-                        RichText::new("Hide messages from users with selected badges.")
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                    let hidden_badges: HashSet<String> = self
-                        .config
-                        .global_filters
-                        .hidden_badge_types
-                        .iter()
-                        .filter_map(|value| normalize_badge_type(value))
-                        .collect();
-
-                    for badge_type in badge_type_filters {
-                        let mut show_badge = !hidden_badges.contains(badge_type.as_str());
-                        let label = format!("Show {}", format_badge_type_label(&badge_type));
-                        if ui.checkbox(&mut show_badge, label).changed() {
-                            self.set_badge_type_hidden(&badge_type, !show_badge);
-                            filter_logic_changed = true;
-                        }
-                    }
-                });
-
-                ui.collapsing("Appearance", |ui| {
-                    appearance_changed |= ui.checkbox(&mut self.config.ui.show_badges, "Show badges").changed();
-                    appearance_changed |= ui
-                        .checkbox(&mut self.config.ui.show_per_user_name_colors, "Use per-user name colors")
-                        .changed();
-
-                    if !self.config.ui.show_per_user_name_colors {
-                        appearance_changed |= ui.horizontal(|ui| {
-                            ui.label("Username color");
-                            let mut color = color32_from_rgb(self.config.ui.fallback_user_name_color);
-                            let changed = egui::color_picker::color_edit_button_srgba(
-                                ui,
-                                &mut color,
-                                egui::color_picker::Alpha::Opaque,
-                            )
-                            .changed();
-                            if changed {
-                                self.config.ui.fallback_user_name_color = rgb_from_color32(color);
+                        ui.horizontal(|ui| {
+                            ui.label("Include");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.filter_fields.include_terms,
+                                    )
+                                    .hint_text("comma-separated"),
+                                )
+                                .changed()
+                            {
+                                self.apply_filter_fields_to_config();
                             }
-                            changed
-                        }).inner;
-                    }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Exclude");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.filter_fields.exclude_terms,
+                                    )
+                                    .hint_text("comma-separated"),
+                                )
+                                .changed()
+                            {
+                                self.apply_filter_fields_to_config();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Highlight");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.filter_fields.highlight_terms,
+                                    )
+                                    .hint_text("comma-separated"),
+                                )
+                                .changed()
+                            {
+                                self.apply_filter_fields_to_config();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Hidden users");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.filter_fields.hidden_users,
+                                    )
+                                    .hint_text("comma-separated"),
+                                )
+                                .changed()
+                            {
+                                self.apply_filter_fields_to_config();
+                            }
+                        });
 
-                    appearance_changed |= ui.horizontal(|ui| {
-                        ui.label("Text color");
-                        let mut color = color32_from_rgb(self.config.ui.chat_text_color);
-                        let changed = egui::color_picker::color_edit_button_srgba(
-                            ui,
-                            &mut color,
-                            egui::color_picker::Alpha::Opaque,
-                        )
-                        .changed();
-                        if changed {
-                            self.config.ui.chat_text_color = rgb_from_color32(color);
+                        ui.separator();
+
+                        let mut filter_logic_changed = false;
+                        let mut appearance_changed = false;
+                        filter_logic_changed |= ui
+                            .horizontal(|ui| {
+                                ui.label("Min length");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.config.global_filters.min_message_len,
+                                    )
+                                    .range(0..=500),
+                                )
+                                .changed()
+                            })
+                            .inner;
+
+                        ui.collapsing("Message visibility", |ui| {
+                            let v = &mut self.config.global_filters.visibility;
+                            filter_logic_changed |=
+                                ui.checkbox(&mut v.show_mod_messages, "Show mods").changed();
+                            filter_logic_changed |=
+                                ui.checkbox(&mut v.show_vip_messages, "Show VIPs").changed();
+                            filter_logic_changed |= ui
+                                .checkbox(&mut v.show_subscriber_messages, "Show subscribers")
+                                .changed();
+                            filter_logic_changed |= ui
+                                .checkbox(
+                                    &mut v.show_non_subscriber_messages,
+                                    "Show non-subscribers",
+                                )
+                                .changed();
+                            filter_logic_changed |= ui
+                                .checkbox(&mut v.show_cheers, "Show cheers/bits")
+                                .changed();
+                            filter_logic_changed |= ui
+                                .checkbox(&mut v.show_redeems, "Show redeems/highlights")
+                                .changed();
+                            filter_logic_changed |= ui
+                                .checkbox(&mut v.show_system_notices, "Show system notices")
+                                .changed();
+                        });
+
+                        let badge_type_filters = self.badge_type_filter_options();
+                        ui.collapsing("Badge types", |ui| {
+                            if badge_type_filters.is_empty() {
+                                ui.label(
+                                    RichText::new("No badge types seen yet.").color(Color32::GRAY),
+                                );
+                                return;
+                            }
+
+                            ui.label(
+                                RichText::new("Hide messages from users with selected badges.")
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                            let hidden_badges: HashSet<String> = self
+                                .config
+                                .global_filters
+                                .hidden_badge_types
+                                .iter()
+                                .filter_map(|value| normalize_badge_type(value))
+                                .collect();
+
+                            for badge_type in badge_type_filters {
+                                let mut show_badge = !hidden_badges.contains(badge_type.as_str());
+                                let label =
+                                    format!("Show {}", format_badge_type_label(&badge_type));
+                                if ui.checkbox(&mut show_badge, label).changed() {
+                                    self.set_badge_type_hidden(&badge_type, !show_badge);
+                                    filter_logic_changed = true;
+                                }
+                            }
+                        });
+
+                        ui.collapsing("Appearance", |ui| {
+                            appearance_changed |= ui
+                                .checkbox(&mut self.config.ui.show_badges, "Show badges")
+                                .changed();
+                            appearance_changed |= ui
+                                .checkbox(
+                                    &mut self.config.ui.show_per_user_name_colors,
+                                    "Use per-user name colors",
+                                )
+                                .changed();
+
+                            if !self.config.ui.show_per_user_name_colors {
+                                appearance_changed |= ui
+                                    .horizontal(|ui| {
+                                        ui.label("Username color");
+                                        let mut color = color32_from_rgb(
+                                            self.config.ui.fallback_user_name_color,
+                                        );
+                                        let changed = egui::color_picker::color_edit_button_srgba(
+                                            ui,
+                                            &mut color,
+                                            egui::color_picker::Alpha::Opaque,
+                                        )
+                                        .changed();
+                                        if changed {
+                                            self.config.ui.fallback_user_name_color =
+                                                rgb_from_color32(color);
+                                        }
+                                        changed
+                                    })
+                                    .inner;
+                            }
+
+                            appearance_changed |= ui
+                                .horizontal(|ui| {
+                                    ui.label("Text color");
+                                    let mut color =
+                                        color32_from_rgb(self.config.ui.chat_text_color);
+                                    let changed = egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut color,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .changed();
+                                    if changed {
+                                        self.config.ui.chat_text_color = rgb_from_color32(color);
+                                    }
+                                    changed
+                                })
+                                .inner;
+
+                            appearance_changed |= ui
+                                .horizontal(|ui| {
+                                    ui.label("Background");
+                                    let mut color =
+                                        color32_from_rgb(self.config.ui.chat_background_color);
+                                    let changed = egui::color_picker::color_edit_button_srgba(
+                                        ui,
+                                        &mut color,
+                                        egui::color_picker::Alpha::Opaque,
+                                    )
+                                    .changed();
+                                    if changed {
+                                        self.config.ui.chat_background_color =
+                                            rgb_from_color32(color);
+                                    }
+                                    changed
+                                })
+                                .inner;
+                        });
+
+                        if filter_logic_changed {
+                            self.filter_engine
+                                .set_config(self.config.global_filters.clone());
+                            self.chat_store.recompute_filters(&self.filter_engine);
+                            self.mark_config_dirty();
                         }
-                        changed
-                    }).inner;
-
-                    appearance_changed |= ui.horizontal(|ui| {
-                        ui.label("Background");
-                        let mut color = color32_from_rgb(self.config.ui.chat_background_color);
-                        let changed = egui::color_picker::color_edit_button_srgba(
-                            ui,
-                            &mut color,
-                            egui::color_picker::Alpha::Opaque,
-                        )
-                        .changed();
-                        if changed {
-                            self.config.ui.chat_background_color = rgb_from_color32(color);
+                        if appearance_changed {
+                            self.mark_config_dirty();
                         }
-                        changed
-                    }).inner;
-                });
 
-                if filter_logic_changed {
-                    self.filter_engine.set_config(self.config.global_filters.clone());
-                    self.chat_store.recompute_filters(&self.filter_engine);
-                    self.mark_config_dirty();
-                }
-                if appearance_changed {
-                    self.mark_config_dirty();
-                }
-
-                ui.separator();
-                if ui.button("Clear visible view").clicked() {
-                    self.chat_store.clear_visible_view();
-                }
-                if ui.button("Reset filters").clicked() {
-                    self.config.global_filters = GlobalFilterConfig::default();
-                    self.filter_fields = FilterTextFields::from_config(&self.config.global_filters);
-                    self.filter_engine.set_config(self.config.global_filters.clone());
-                    self.chat_store.recompute_filters(&self.filter_engine);
-                    self.mark_config_dirty();
-                }
+                        ui.separator();
+                        if ui.button("Clear visible view").clicked() {
+                            self.chat_store.clear_visible_view();
+                        }
+                        if ui.button("Reset filters").clicked() {
+                            self.config.global_filters = GlobalFilterConfig::default();
+                            self.filter_fields =
+                                FilterTextFields::from_config(&self.config.global_filters);
+                            self.filter_engine
+                                .set_config(self.config.global_filters.clone());
+                            self.chat_store.recompute_filters(&self.filter_engine);
+                            self.mark_config_dirty();
+                        }
                     });
             });
     }
 
     fn render_chat(&mut self, ctx: &egui::Context) {
-        let visible_entries = self.chat_store.visible_entries_cloned();
+        const MANUAL_SCROLL_BREAK_THRESHOLD: f32 = 18.0;
+        let focused_sender_login = self.focused_sender_login.clone();
         let chat_typography = ChatTypography::from_ui_config(&self.config.ui);
         let chat_appearance = ChatAppearance::from_ui_config(&self.config.ui);
-        let now_utc = Utc::now();
+        let previous_offset_y = self.chat_scroll.offset_y;
+        let previous_max_scroll_y = self.chat_scroll.max_offset_y;
+        let row_height_fallback = chat_typography.row_height();
+        let estimated_row_height = self
+            .row_layout_cache
+            .average_row_height(row_height_fallback)
+            .max(row_height_fallback);
+        let visible_count = if focused_sender_login.is_some() {
+            self.chat_store
+                .visible_entries()
+                .filter(|entry| matches_focused_sender(entry, focused_sender_login.as_deref()))
+                .count()
+        } else {
+            self.chat_store.visible_len()
+        };
         let bottom_padding_px = 18.0_f32;
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(chat_appearance.background_color))
             .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button(if self.config.ui.filters_panel_open {
-                        "Close Sidebar"
-                    } else {
-                        "Open Sidebar"
-                    })
-                    .clicked()
-                {
-                    self.toggle_sidebar();
-                }
-                ui.checkbox(&mut self.visible_stick_to_bottom, "Stick to bottom");
-                if self.chat_scroll.should_show_jump_button() {
-                    if ui.button("Jump to latest").clicked() {
-                        self.visible_stick_to_bottom = true;
-                        self.jump_to_latest_requested = true;
-                    }
-                }
-                if let Some(err) = &self.last_config_save_error {
-                    ui.colored_label(Color32::RED, format!("Config save error: {err}"));
-                }
-            });
-            ui.separator();
-
-            if visible_entries.is_empty() {
-                ui.add_space(12.0);
-                let placeholder = match &self.connection_state {
-                    ConnectionState::Disconnected => "Enter a Twitch channel username and press Connect.",
-                    ConnectionState::Connecting { .. } => "Connecting to Twitch chat...",
-                    ConnectionState::Connected { channel: _ } => {
-                        if self.chat_store.is_empty() {
-                            // Connected but no messages have arrived yet (quiet/offline/slow channel).
-                            // Keep this explicit so the UI doesn't look frozen.
-                            "Connected. Waiting for messages..."
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if self.config.ui.filters_panel_open {
+                            "Close Sidebar"
                         } else {
-                            "No messages match the current filters."
+                            "Open Sidebar"
+                        })
+                        .clicked()
+                    {
+                        self.toggle_sidebar();
+                    }
+                    ui.checkbox(&mut self.visible_stick_to_bottom, "Stick to bottom");
+                    if !self.visible_stick_to_bottom && self.chat_scroll.should_show_jump_button() {
+                        if ui.button("Jump to latest").clicked() {
+                            self.visible_stick_to_bottom = true;
+                            self.jump_to_latest_requested = true;
                         }
                     }
-                    ConnectionState::Reconnecting { .. } => "Connection lost. Reconnecting...",
-                    ConnectionState::Error { .. } => "Connection failed. Check the channel name and try again.",
-                };
-                ui.label(RichText::new(placeholder).color(Color32::GRAY));
-            }
-            let mut scroll_area = egui::ScrollArea::vertical()
-                .stick_to_bottom(self.visible_stick_to_bottom)
-                .auto_shrink([false, false]);
-            if self.jump_to_latest_requested {
-                scroll_area = scroll_area.vertical_scroll_offset(self.chat_scroll.jump_target_offset());
-            }
-            let mut clicked_message_id: Option<String> = None;
-            let scroll_output = scroll_area.show(ui, |ui| {
-                for entry in &visible_entries {
-                    let clicked = render_chat_row(
-                        ui,
-                        entry,
-                        &self.asset_cache,
-                        &mut self.row_layout_cache,
-                        chat_typography,
-                        chat_appearance,
-                        self.popout_selected_message_id.as_deref()
-                            == Some(entry.message.id.as_str()),
-                        true,
-                        ChatRowAnimation::for_message(entry, &self.config.ui, now_utc),
+                    if let Some(sender_login) = focused_sender_login.as_deref() {
+                        ui.separator();
+                        ui.label(format!("Only @{sender_login}"));
+                        if ui.button("Show all users").clicked() {
+                            self.toggle_focused_sender_login(sender_login.to_owned());
+                        }
+                    }
+                    if let Some(err) = &self.last_config_save_error {
+                        ui.colored_label(Color32::RED, format!("Config save error: {err}"));
+                    }
+                });
+                ui.separator();
+
+                if visible_count == 0 {
+                    ui.add_space(12.0);
+                    let placeholder = match &self.connection_state {
+                        ConnectionState::Disconnected => {
+                            "Enter a Twitch channel username and press Connect.".to_owned()
+                        }
+                        ConnectionState::Connecting { .. } => {
+                            "Connecting to Twitch chat...".to_owned()
+                        }
+                        ConnectionState::Connected { channel: _ } => {
+                            if let Some(sender_login) = focused_sender_login.as_deref() {
+                                if self.chat_store.is_empty() {
+                                    "Connected. Waiting for messages...".to_owned()
+                                } else {
+                                    format!("No visible messages from @{sender_login}.")
+                                }
+                            } else if self.chat_store.is_empty() {
+                                // Connected but no messages have arrived yet (quiet/offline/slow channel).
+                                // Keep this explicit so the UI doesn't look frozen.
+                                "Connected. Waiting for messages...".to_owned()
+                            } else {
+                                "No messages match the current filters.".to_owned()
+                            }
+                        }
+                        ConnectionState::Reconnecting { .. } => {
+                            "Connection lost. Reconnecting...".to_owned()
+                        }
+                        ConnectionState::Error { .. } => {
+                            "Connection failed. Check the channel name and try again.".to_owned()
+                        }
+                    };
+                    ui.label(RichText::new(placeholder).color(Color32::GRAY));
+                }
+                let mut scroll_area = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(self.visible_stick_to_bottom);
+                if self.jump_to_latest_requested {
+                    scroll_area =
+                        scroll_area.vertical_scroll_offset(self.chat_scroll.jump_target_offset());
+                }
+                let mut clicked_message_id: Option<String> = None;
+                let mut clicked_sender_login: Option<String> = None;
+                let selected_message_id = self.popout_selected_message_id.clone();
+                let scroll_output = scroll_area.show_viewport(ui, |ui, viewport| {
+                    let virtual_range = approximate_virtual_range(
+                        viewport,
+                        visible_count,
+                        estimated_row_height,
+                        10,
+                        self.visible_stick_to_bottom,
                     );
-                    if clicked {
-                        clicked_message_id = Some(entry.message.id.clone());
+
+                    if virtual_range.top_spacer > 0.0 {
+                        ui.add_space(virtual_range.top_spacer);
+                    }
+
+                    for entry in collect_virtual_entries(
+                        &self.chat_store,
+                        focused_sender_login.as_deref(),
+                        visible_count,
+                        virtual_range.start_idx,
+                        virtual_range.take_count,
+                    ) {
+                        let interaction = render_chat_row(
+                            ui,
+                            entry,
+                            &self.asset_cache,
+                            &mut self.row_layout_cache,
+                            chat_typography,
+                            chat_appearance,
+                            selected_message_id.as_deref() == Some(entry.message.id.as_str()),
+                            true,
+                        );
+                        if let Some(sender_login) = interaction.clicked_sender_login {
+                            clicked_sender_login = Some(sender_login);
+                        } else if interaction.row_clicked {
+                            clicked_message_id = Some(entry.message.id.clone());
+                        }
+                    }
+
+                    if virtual_range.bottom_spacer > 0.0 {
+                        ui.add_space(virtual_range.bottom_spacer);
+                    }
+                    ui.add_space(bottom_padding_px);
+                });
+                let max_scroll_y =
+                    (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
+                let current_offset = scroll_output.state.offset.y.max(0.0).min(max_scroll_y);
+                if self.visible_stick_to_bottom && !self.jump_to_latest_requested {
+                    let content_shrank =
+                        max_scroll_y + MANUAL_SCROLL_BREAK_THRESHOLD < previous_max_scroll_y;
+                    let user_scrolled_up =
+                        current_offset + MANUAL_SCROLL_BREAK_THRESHOLD < previous_offset_y;
+                    let moved_away_from_bottom =
+                        current_offset + MANUAL_SCROLL_BREAK_THRESHOLD < max_scroll_y;
+                    if !content_shrank && user_scrolled_up && moved_away_from_bottom {
+                        self.visible_stick_to_bottom = false;
                     }
                 }
-                ui.add_space(bottom_padding_px);
+                self.chat_scroll.update(current_offset, max_scroll_y);
+                self.jump_to_latest_requested = false;
+                if let Some(sender_login) = clicked_sender_login {
+                    self.toggle_focused_sender_login(sender_login);
+                } else if let Some(clicked_id) = clicked_message_id {
+                    self.toggle_popout_message_selection(clicked_id);
+                }
             });
-            let max_scroll_y =
-                (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
-            self.chat_scroll
-                .update(scroll_output.state.offset.y, max_scroll_y);
-            self.jump_to_latest_requested = false;
-            if let Some(clicked_id) = clicked_message_id {
-                self.toggle_popout_message_selection(clicked_id);
-            }
-        });
     }
 
     fn render_popout_chat_viewport(&mut self, ctx: &egui::Context) {
@@ -1537,14 +1879,10 @@ impl FastChatApp {
             return;
         }
 
-        let mut visible_entries = self.chat_store.visible_entries_cloned();
-        let selection_active = self.popout_selected_message_id.is_some();
-        if let Some(selected_id) = self.popout_selected_message_id.as_deref() {
-            visible_entries.retain(|entry| entry.message.id == selected_id);
-        }
+        let selected_message_id = self.popout_selected_message_id.clone();
+        let mut clicked_sender_login: Option<String> = None;
         let chat_typography = ChatTypography::from_popout_ui_config(&self.config.ui);
         let chat_appearance = ChatAppearance::from_ui_config(&self.config.ui);
-        let now_utc = Utc::now();
         let mut viewport_builder = egui::ViewportBuilder::default()
             .with_title("Fast Chat - Popout")
             .with_inner_size([
@@ -1552,8 +1890,10 @@ impl FastChatApp {
                 self.config.popout_window.height.max(240.0),
             ])
             .with_min_inner_size([320.0, 240.0]);
-        if let (Some(x), Some(y)) = (self.config.popout_window.pos_x, self.config.popout_window.pos_y)
-        {
+        if let (Some(x), Some(y)) = (
+            self.config.popout_window.pos_x,
+            self.config.popout_window.pos_y,
+        ) {
             viewport_builder = viewport_builder.with_position(egui::pos2(x, y));
         }
         if self.config.popout_window.maximized {
@@ -1565,7 +1905,10 @@ impl FastChatApp {
             viewport_builder,
             |popout_ctx, viewport_class| {
                 let viewport_info = popout_ctx.input(|i| i.viewport().clone());
-                if apply_viewport_info_to_window_config(&viewport_info, &mut self.config.popout_window) {
+                if apply_viewport_info_to_window_config(
+                    &viewport_info,
+                    &mut self.config.popout_window,
+                ) {
                     self.mark_config_dirty();
                 }
                 if popout_ctx.input(|i| i.viewport().close_requested()) {
@@ -1583,11 +1926,10 @@ impl FastChatApp {
                             .show(popout_ctx, |ui| {
                                 self.render_popout_chat_contents(
                                     ui,
-                                    &visible_entries,
-                                    selection_active,
+                                    selected_message_id.as_deref(),
                                     chat_typography,
                                     chat_appearance,
-                                    now_utc,
+                                    &mut clicked_sender_login,
                                 );
                             });
                         self.popout_window_open = open;
@@ -1598,49 +1940,89 @@ impl FastChatApp {
                             .show(popout_ctx, |ui| {
                                 self.render_popout_chat_contents(
                                     ui,
-                                    &visible_entries,
-                                    selection_active,
+                                    selected_message_id.as_deref(),
                                     chat_typography,
                                     chat_appearance,
-                                    now_utc,
+                                    &mut clicked_sender_login,
                                 );
                             });
                     }
                 }
             },
         );
+        if let Some(sender_login) = clicked_sender_login {
+            self.toggle_focused_sender_login(sender_login);
+        }
     }
 
     fn render_popout_chat_contents(
         &mut self,
         ui: &mut egui::Ui,
-        visible_entries: &[StoredChatEntry],
-        selection_active: bool,
+        selected_message_id: Option<&str>,
         chat_typography: ChatTypography,
         chat_appearance: ChatAppearance,
-        now_utc: chrono::DateTime<Utc>,
+        clicked_sender_login: &mut Option<String>,
     ) {
         let bottom_padding_px = 18.0_f32;
-        let show_custom_overlay =
-            self.popout_custom_message_visible && !self.popout_custom_message_text.trim().is_empty();
+        let row_height_fallback = chat_typography.row_height();
+        let estimated_row_height = self
+            .popout_row_layout_cache
+            .average_row_height(row_height_fallback)
+            .max(row_height_fallback);
+        let selection_active = selected_message_id.is_some();
+        let focused_sender_login = self.focused_sender_login.clone();
+        let selected_entry = selected_message_id.and_then(|selected_id| {
+            self.chat_store
+                .visible_entries()
+                .filter(|entry| matches_focused_sender(entry, focused_sender_login.as_deref()))
+                .find(|entry| entry.message.id == selected_id)
+        });
+        let visible_count = if selected_entry.is_some() {
+            1
+        } else if selection_active {
+            0
+        } else {
+            if focused_sender_login.is_some() {
+                self.chat_store
+                    .visible_entries()
+                    .filter(|entry| matches_focused_sender(entry, focused_sender_login.as_deref()))
+                    .count()
+            } else {
+                self.chat_store.visible_len()
+            }
+        };
+        let show_custom_overlay = self.popout_custom_message_visible
+            && !self.popout_custom_message_text.trim().is_empty();
 
-        if visible_entries.is_empty() {
+        if visible_count == 0 {
             ui.add_space(12.0);
             let placeholder = if selection_active {
-                "Selected message is no longer in the visible buffer. Click a message in the main chat."
+                "Selected message is no longer in the visible buffer. Click a message in the main chat.".to_owned()
             } else {
                 match &self.connection_state {
-                    ConnectionState::Disconnected => "Enter a Twitch channel username and press Connect.",
-                    ConnectionState::Connecting { .. } => "Connecting to Twitch chat...",
+                    ConnectionState::Disconnected => {
+                        "Enter a Twitch channel username and press Connect.".to_owned()
+                    }
+                    ConnectionState::Connecting { .. } => "Connecting to Twitch chat...".to_owned(),
                     ConnectionState::Connected { channel: _ } => {
-                        if self.chat_store.is_empty() {
-                            "Connected. Waiting for messages..."
+                        if let Some(sender_login) = focused_sender_login.as_deref() {
+                            if self.chat_store.is_empty() {
+                                "Connected. Waiting for messages...".to_owned()
+                            } else {
+                                format!("No visible messages from @{sender_login}.")
+                            }
+                        } else if self.chat_store.is_empty() {
+                            "Connected. Waiting for messages...".to_owned()
                         } else {
-                            "No messages match the current filters."
+                            "No messages match the current filters.".to_owned()
                         }
                     }
-                    ConnectionState::Reconnecting { .. } => "Connection lost. Reconnecting...",
-                    ConnectionState::Error { .. } => "Connection failed. Check the channel name and try again.",
+                    ConnectionState::Reconnecting { .. } => {
+                        "Connection lost. Reconnecting...".to_owned()
+                    }
+                    ConnectionState::Error { .. } => {
+                        "Connection failed. Check the channel name and try again.".to_owned()
+                    }
                 }
             };
             ui.label(RichText::new(placeholder).color(Color32::GRAY));
@@ -1650,29 +2032,73 @@ impl FastChatApp {
             if show_custom_overlay {
                 ui.multiply_opacity(0.35);
             }
-            egui::ScrollArea::vertical()
+            let _scroll_output = egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                for entry in visible_entries {
-                    render_chat_row(
-                        ui,
-                        entry,
-                        &self.asset_cache,
-                        &mut self.row_layout_cache,
-                        chat_typography,
-                        chat_appearance,
-                        false,
-                        false,
-                        ChatRowAnimation::for_message(entry, &self.config.ui, now_utc),
+                .show_viewport(ui, |ui, viewport| {
+                    if let Some(entry) = selected_entry {
+                        let interaction = render_chat_row(
+                            ui,
+                            entry,
+                            &self.asset_cache,
+                            &mut self.popout_row_layout_cache,
+                            chat_typography,
+                            chat_appearance,
+                            false,
+                            false,
+                        );
+                        if let Some(sender_login) = interaction.clicked_sender_login {
+                            *clicked_sender_login = Some(sender_login);
+                        }
+                        ui.add_space(bottom_padding_px);
+                        return;
+                    }
+
+                    let virtual_range = approximate_virtual_range(
+                        viewport,
+                        visible_count,
+                        estimated_row_height,
+                        10,
+                        true,
                     );
-                }
-                ui.add_space(bottom_padding_px);
-            });
+
+                    if virtual_range.top_spacer > 0.0 {
+                        ui.add_space(virtual_range.top_spacer);
+                    }
+                    for entry in collect_virtual_entries(
+                        &self.chat_store,
+                        focused_sender_login.as_deref(),
+                        visible_count,
+                        virtual_range.start_idx,
+                        virtual_range.take_count,
+                    ) {
+                        let interaction = render_chat_row(
+                            ui,
+                            entry,
+                            &self.asset_cache,
+                            &mut self.popout_row_layout_cache,
+                            chat_typography,
+                            chat_appearance,
+                            false,
+                            false,
+                        );
+                        if let Some(sender_login) = interaction.clicked_sender_login {
+                            *clicked_sender_login = Some(sender_login);
+                        }
+                    }
+                    if virtual_range.bottom_spacer > 0.0 {
+                        ui.add_space(virtual_range.bottom_spacer);
+                    }
+                    ui.add_space(bottom_padding_px);
+                });
         });
 
         if show_custom_overlay {
-            render_popout_custom_message_overlay(ui, &self.popout_custom_message_text, chat_typography);
+            render_popout_custom_message_overlay(
+                ui,
+                &self.popout_custom_message_text,
+                chat_typography,
+            );
         }
     }
 
@@ -1682,9 +2108,15 @@ impl FastChatApp {
                 let stats = self.ui_snapshot.store_stats;
                 ui.label(format!("Visible: {}", stats.visible_messages));
                 ui.separator();
-                ui.label(format!("In-memory: {}/{}", stats.total_messages, stats.capacity));
+                ui.label(format!(
+                    "In-memory: {}/{}",
+                    stats.total_messages, stats.capacity
+                ));
                 ui.separator();
-                ui.label(format!("Processed events: {}", self.ui_snapshot.processed_events_total));
+                ui.label(format!(
+                    "Processed events: {}",
+                    self.ui_snapshot.processed_events_total
+                ));
                 ui.separator();
                 ui.label(format!("Disk log dir: {}", self.paths.logs_dir.display()));
                 if let Some(status) = &self.ui_snapshot.last_status {
@@ -1701,14 +2133,27 @@ impl FastChatApp {
         }
         egui::Window::new("Perf")
             .default_pos(egui::pos2(20.0, 80.0))
+            .fixed_size(egui::vec2(260.0, 140.0))
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(format!("FPS: {:.1}", self.perf_overlay.fps()));
-                ui.label(format!("Avg frame: {:.2} ms", self.perf_overlay.avg_ms()));
-                ui.label(format!("Last frame: {:.2} ms", self.perf_overlay.last_frame_ms()));
-                ui.label(format!("Visible msgs: {}", self.ui_snapshot.store_stats.visible_messages));
-                ui.label(format!("Total msgs: {}", self.ui_snapshot.store_stats.total_messages));
+                ui.monospace(format!("FPS:        {:>7.1}", self.perf_overlay.fps()));
+                ui.monospace(format!(
+                    "Avg frame:  {:>7.2} ms",
+                    self.perf_overlay.avg_ms()
+                ));
+                ui.monospace(format!(
+                    "Last frame: {:>7.2} ms",
+                    self.perf_overlay.last_frame_ms()
+                ));
+                ui.monospace(format!(
+                    "Visible:    {:>7}",
+                    self.ui_snapshot.store_stats.visible_messages
+                ));
+                ui.monospace(format!(
+                    "Total:      {:>7}",
+                    self.ui_snapshot.store_stats.total_messages
+                ));
             });
     }
 }
@@ -1745,6 +2190,12 @@ impl eframe::App for FastChatApp {
     }
 }
 
+#[derive(Default)]
+struct ChatRowInteraction {
+    row_clicked: bool,
+    clicked_sender_login: Option<String>,
+}
+
 fn render_chat_row(
     ui: &mut egui::Ui,
     entry: &StoredChatEntry,
@@ -1754,8 +2205,7 @@ fn render_chat_row(
     appearance: ChatAppearance,
     is_selected: bool,
     selection_click_enabled: bool,
-    animation: Option<ChatRowAnimation>,
-) -> bool {
+) -> ChatRowInteraction {
     let bg = if is_selected {
         Color32::from_rgb(0x1A, 0x3F, 0x66)
     } else if entry.filter.highlighted {
@@ -1765,67 +2215,91 @@ fn render_chat_row(
     };
     let min_row_height = typography.row_height();
     const ROW_LEFT_PADDING: f32 = 6.0;
+    let mut clicked_sender_login = None;
+    let mut message_click_start_x = None;
 
     let row = egui::Frame::NONE.fill(bg).show(ui, |ui| {
-            ui.set_min_height(min_row_height);
-            if let Some(animation) = animation {
-                ui.set_opacity(animation.opacity);
-                if animation.x_offset > 0.0 {
-                    ui.add_space(animation.x_offset);
+        ui.set_min_height(min_row_height);
+        ui.add_space(ROW_LEFT_PADDING);
+        ui.horizontal_wrapped(|ui| {
+            if appearance.show_badges {
+                for badge in assets.resolve_badges_for_message(&entry.message) {
+                    assets.render_badge_presentation(ui, &badge, typography);
                 }
             }
-            ui.add_space(ROW_LEFT_PADDING);
-            ui.horizontal_wrapped(|ui| {
-                if appearance.show_badges {
-                    for badge in assets.resolve_badges_for_message(&entry.message) {
-                        assets.render_badge_presentation(ui, &badge, typography);
-                    }
-                }
 
-                let name_text = if entry.message.flags.is_deleted {
-                    format!("{} (deleted)", entry.message.display_name)
-                } else {
-                    entry.message.display_name.clone()
-                };
-                let mut username = RichText::new(name_text)
-                    .strong()
-                    .size(typography.size)
-                    .family(typography.egui_family());
-                if appearance.show_per_user_name_colors {
-                    if let Some(color) = entry.message.name_color {
-                        username = username.color(color32_from_rgb(color));
-                    } else {
-                        username = username.color(appearance.fallback_user_name_color);
-                    }
+            let name_text = if entry.message.flags.is_deleted {
+                format!("{} (deleted)", entry.message.display_name)
+            } else {
+                entry.message.display_name.clone()
+            };
+            let mut username = RichText::new(name_text)
+                .strong()
+                .size(typography.size)
+                .family(typography.egui_family());
+            if appearance.show_per_user_name_colors {
+                if let Some(color) = entry.message.name_color {
+                    username = username.color(color32_from_rgb(color));
                 } else {
                     username = username.color(appearance.fallback_user_name_color);
                 }
-                ui.label(username);
-                ui.label(
-                    RichText::new(":")
-                        .size(typography.size)
-                        .family(typography.egui_family())
-                        .color(appearance.text_color),
-                );
+            } else {
+                username = username.color(appearance.fallback_user_name_color);
+            }
+            let username_response = ui
+                .add(egui::Label::new(username).sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!(
+                    "Show only messages from @{}",
+                    entry.message.sender_login
+                ));
+            if username_response.clicked() {
+                clicked_sender_login = Some(entry.message.sender_login.clone());
+            }
+            ui.label(
+                RichText::new(":")
+                    .size(typography.size)
+                    .family(typography.egui_family())
+                    .color(appearance.text_color),
+            );
+            message_click_start_x = Some(ui.cursor().min.x);
 
-                render_fragments(ui, &entry.message, assets, typography, appearance);
-            });
+            render_fragments(ui, &entry.message, assets, typography, appearance);
+        });
     });
     let rendered_height = row.response.rect.height();
     let row_rect = row.response.rect;
     row.response.on_hover_text(&entry.message.raw_text);
     row_cache.note_row(stable_row_key(entry), rendered_height);
 
-    if !selection_click_enabled {
-        return false;
+    if let Some(sender_login) = clicked_sender_login {
+        return ChatRowInteraction {
+            row_clicked: false,
+            clicked_sender_login: Some(sender_login),
+        };
     }
 
-    let click_id = ui
-        .id()
-        .with("chat_row_click")
-        .with(stable_row_key(entry));
-    let click_response = ui.interact(row_rect, click_id, egui::Sense::click());
-    click_response.clicked()
+    if !selection_click_enabled {
+        return ChatRowInteraction::default();
+    }
+
+    let message_click_start_x = message_click_start_x
+        .unwrap_or(row_rect.min.x)
+        .clamp(row_rect.min.x, row_rect.max.x);
+    let click_rect = egui::Rect::from_min_max(
+        egui::pos2(message_click_start_x, row_rect.min.y),
+        row_rect.max,
+    );
+    if click_rect.width() <= 0.0 {
+        return ChatRowInteraction::default();
+    }
+
+    let click_id = ui.id().with("chat_row_click").with(stable_row_key(entry));
+    let click_response = ui.interact(click_rect, click_id, egui::Sense::click());
+    ChatRowInteraction {
+        row_clicked: click_response.clicked(),
+        clicked_sender_login: None,
+    }
 }
 
 fn render_fragments(
@@ -1928,11 +2402,101 @@ fn render_popout_custom_message_overlay(
         });
 }
 
+#[derive(Clone, Copy)]
+struct ApproxVirtualRange {
+    start_idx: usize,
+    take_count: usize,
+    top_spacer: f32,
+    bottom_spacer: f32,
+}
+
+fn approximate_virtual_range(
+    viewport: egui::Rect,
+    visible_count: usize,
+    estimated_row_height: f32,
+    overscan_rows: usize,
+    anchor_to_bottom: bool,
+) -> ApproxVirtualRange {
+    if visible_count == 0 {
+        return ApproxVirtualRange {
+            start_idx: 0,
+            take_count: 0,
+            top_spacer: 0.0,
+            bottom_spacer: 0.0,
+        };
+    }
+
+    let row_height = estimated_row_height.max(1.0);
+    if anchor_to_bottom {
+        let visible_rows = (viewport.height() / row_height).ceil().max(0.0) as usize;
+        let take_count = visible_rows
+            .saturating_add(overscan_rows.saturating_mul(2))
+            .max(1)
+            .min(visible_count);
+        let start_idx = visible_count.saturating_sub(take_count);
+        return ApproxVirtualRange {
+            start_idx,
+            take_count,
+            top_spacer: start_idx as f32 * row_height,
+            bottom_spacer: 0.0,
+        };
+    }
+
+    let first_visible = (viewport.min.y / row_height).floor().max(0.0) as usize;
+    let last_visible_exclusive = (viewport.max.y / row_height).ceil().max(0.0) as usize;
+    let start_idx = first_visible
+        .saturating_sub(overscan_rows)
+        .min(visible_count);
+    let end_idx = last_visible_exclusive
+        .saturating_add(overscan_rows)
+        .min(visible_count);
+    ApproxVirtualRange {
+        start_idx,
+        take_count: end_idx.saturating_sub(start_idx),
+        top_spacer: start_idx as f32 * row_height,
+        bottom_spacer: visible_count.saturating_sub(end_idx) as f32 * row_height,
+    }
+}
+
 fn stable_row_key(entry: &StoredChatEntry) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     entry.message.id.hash(&mut hasher);
     hasher.finish()
+}
+
+fn matches_focused_sender(entry: &StoredChatEntry, focused_sender_login: Option<&str>) -> bool {
+    match focused_sender_login {
+        Some(sender_login) => entry.message.sender_login == sender_login,
+        None => true,
+    }
+}
+
+fn collect_virtual_entries<'a>(
+    store: &'a ChatStore,
+    focused_sender_login: Option<&str>,
+    visible_count: usize,
+    start_idx: usize,
+    take_count: usize,
+) -> Vec<&'a StoredChatEntry> {
+    if take_count == 0 || start_idx >= visible_count {
+        return Vec::new();
+    }
+
+    let end_idx = start_idx.saturating_add(take_count).min(visible_count);
+    let render_count = end_idx.saturating_sub(start_idx);
+    let iter = store
+        .visible_entries()
+        .filter(|entry| matches_focused_sender(entry, focused_sender_login));
+
+    if start_idx > visible_count / 2 {
+        let tail_skip = visible_count.saturating_sub(end_idx);
+        let mut entries: Vec<_> = iter.rev().skip(tail_skip).take(render_count).collect();
+        entries.reverse();
+        entries
+    } else {
+        iter.skip(start_idx).take(render_count).collect()
+    }
 }
 
 fn connection_state_label(state: &ConnectionState) -> String {
@@ -1950,6 +2514,49 @@ fn connection_state_label(state: &ConnectionState) -> String {
     }
 }
 
+fn channel_login_for_icon(state: &ConnectionState, channel_input: &str) -> Option<String> {
+    let from_state = match state {
+        ConnectionState::Connecting { channel }
+        | ConnectionState::Connected { channel }
+        | ConnectionState::Reconnecting { channel, .. } => Some(channel.as_str()),
+        ConnectionState::Error {
+            channel: Some(channel),
+            ..
+        } => Some(channel.as_str()),
+        ConnectionState::Disconnected | ConnectionState::Error { channel: None, .. } => None,
+    };
+    from_state
+        .and_then(normalize_channel_login_for_display)
+        .or_else(|| normalize_channel_login_for_display(channel_input))
+}
+
+fn normalize_channel_login_for_display(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.trim_start_matches('#').to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn render_channel_icon_placeholder(ui: &mut egui::Ui, size: f32) {
+    let size = size.max(12.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let radius = size * 0.5;
+    ui.painter()
+        .circle_filled(rect.center(), radius, Color32::from_rgb(44, 46, 52));
+    ui.painter().circle_stroke(
+        rect.center(),
+        radius - 0.5,
+        egui::Stroke::new(1.0, Color32::from_rgb(70, 74, 83)),
+    );
+    response.on_hover_text("Channel icon");
+}
+
 fn popout_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("fastchat_popout_chat")
 }
@@ -1962,7 +2569,11 @@ fn apply_viewport_info_to_window_config(
 
     if let Some(inner_rect) = viewport_info.inner_rect {
         changed |= update_f32(&mut window_config.width, inner_rect.width().max(120.0), 0.5);
-        changed |= update_f32(&mut window_config.height, inner_rect.height().max(120.0), 0.5);
+        changed |= update_f32(
+            &mut window_config.height,
+            inner_rect.height().max(120.0),
+            0.5,
+        );
     }
 
     if let Some(outer_rect) = viewport_info.outer_rect {
@@ -2000,56 +2611,55 @@ fn update_opt_f32(slot: &mut Option<f32>, next: Option<f32>, epsilon: f32) -> bo
     }
 }
 
-fn install_chat_fonts(ctx: &egui::Context) -> Vec<ChatFontFamily> {
+fn install_chat_fonts(ctx: &egui::Context, allow_system_fonts: bool) -> Vec<ChatFontFamily> {
     let mut available = vec![ChatFontFamily::Proportional, ChatFontFamily::Monospace];
     let mut fonts = egui::FontDefinitions::default();
-    let mut changed = false;
 
-    for candidate in system_font_candidates() {
-        if let Some(path) = candidate
-            .paths
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists() && p.is_file())
-        {
-            match fs::read(&path) {
-                Ok(bytes) => {
-                    let mut data = egui::FontData::from_owned(bytes);
-                    data.index = candidate.face_index as u32;
-                    let key = custom_font_family_key(candidate.family).to_owned();
-                    fonts.font_data.insert(key.clone(), Arc::new(data));
+    if allow_system_fonts {
+        for candidate in system_font_candidates() {
+            if let Some(path) = candidate
+                .paths
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists() && p.is_file())
+            {
+                match fs::read(&path) {
+                    Ok(bytes) => {
+                        let mut data = egui::FontData::from_owned(bytes);
+                        data.index = candidate.face_index as u32;
+                        let key = custom_font_family_key(candidate.family).to_owned();
+                        fonts.font_data.insert(key.clone(), Arc::new(data));
 
-                    let mut chain = vec![key.clone()];
-                    let base_list = match candidate.fallback_base {
-                        FontFallbackBase::Proportional => fonts
+                        let mut chain = vec![key.clone()];
+                        let base_list = match candidate.fallback_base {
+                            FontFallbackBase::Proportional => fonts
+                                .families
+                                .get(&egui::FontFamily::Proportional)
+                                .cloned()
+                                .unwrap_or_default(),
+                            FontFallbackBase::Monospace => fonts
+                                .families
+                                .get(&egui::FontFamily::Monospace)
+                                .cloned()
+                                .unwrap_or_default(),
+                        };
+                        chain.extend(base_list);
+                        fonts
                             .families
-                            .get(&egui::FontFamily::Proportional)
-                            .cloned()
-                            .unwrap_or_default(),
-                        FontFallbackBase::Monospace => fonts
-                            .families
-                            .get(&egui::FontFamily::Monospace)
-                            .cloned()
-                            .unwrap_or_default(),
-                    };
-                    chain.extend(base_list);
-                    fonts
-                        .families
-                        .insert(egui::FontFamily::Name(key.into()), chain);
+                            .insert(egui::FontFamily::Name(key.into()), chain);
 
-                    available.push(candidate.family);
-                    changed = true;
-                }
-                Err(err) => {
-                    warn!(path = %path.display(), ?err, "failed to read font file");
+                        available.push(candidate.family);
+                    }
+                    Err(err) => {
+                        warn!(path = %path.display(), ?err, "failed to read font file");
+                    }
                 }
             }
         }
     }
 
-    if changed {
-        ctx.set_fonts(fonts);
-    }
+    // Always apply font definitions so toggling system fonts off resets to pure built-in fonts.
+    ctx.set_fonts(fonts);
 
     available
 }
